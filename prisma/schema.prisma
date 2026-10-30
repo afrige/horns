@@ -1,0 +1,212 @@
+// HORNS — foundation schema (PostgreSQL + Prisma)
+// Owner is identified by env OWNER_USER_ID (server-only), never by a column or username.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  USER
+  MODERATOR
+  ADMIN
+  OWNER // informational only; real owner check = session.userId === env.OWNER_USER_ID
+}
+
+enum AccountStatus {
+  ACTIVE
+  SUSPENDED
+  DELETED // tombstone: row stays so the UID is never reused
+}
+
+enum Rarity {
+  COMMON
+  UNCOMMON
+  RARE
+  EPIC
+  LEGENDARY
+}
+
+enum SubStatus {
+  NONE
+  ACTIVE
+  PAST_DUE
+  CANCELED
+  EXPIRED
+}
+
+enum LinkKind {
+  INSTAGRAM
+  YOUTUBE
+  TIKTOK
+  GITHUB
+  SPOTIFY
+  DISCORD
+  YAPIN
+  TWITCH
+  X
+  CUSTOM
+}
+
+model User {
+  id            String        @id @default(cuid())
+  // Permanent UID: DB sequence, never reset, never reused (deleted users are tombstoned).
+  uid           Int           @unique @default(autoincrement())
+  username      String // display casing
+  usernameLower String        @unique // availability + uniqueness check (case-insensitive)
+  email         String        @unique
+  passwordHash  String
+  role          Role          @default(USER)
+  status        AccountStatus @default(ACTIVE)
+  createdAt     DateTime      @default(now())
+  lastActiveAt  DateTime      @default(now())
+  deletedAt     DateTime?
+
+  profile       Profile?
+  links         Link[]
+  badges        UserBadge[]
+  subscription  Subscription?
+  sessions      Session[]
+  auditActions  AuditLog[]    @relation("AuditActor")
+  auditTargets  AuditLog[]    @relation("AuditTarget")
+
+  @@index([status])
+  @@index([lastActiveAt])
+}
+
+model Session {
+  id        String   @id @default(cuid())
+  userId    String
+  tokenHash String   @unique
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model Profile {
+  userId      String  @id
+  displayName String
+  bio         String  @default("")
+  avatarUrl   String?
+  bannerUrl   String?
+  decoration  String? // key into decoration catalog; premium/owner gated server-side
+  layout      String  @default("classic")
+  // Validated against a Zod schema on the server; premium keys stripped if not entitled.
+  theme       Json    @default("{}") // colors, gradient, opacity, radius, blur, shadow...
+  fonts       Json    @default("{}") // displayName, username, bio, links, headings
+  effects     Json    @default("[]") // [{ key, config }]
+  customCss   String? // sanitized + sandboxed before render
+  draft       Json? // unpublished editor state
+  views       Int     @default(0)
+  publishedAt DateTime?
+  updatedAt   DateTime @updatedAt
+  user        User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model Link {
+  id          String   @id @default(cuid())
+  userId      String
+  kind        LinkKind
+  title       String
+  description String?
+  url         String // validated: https/http only, no javascript:/data:
+  iconKey     String?
+  thumbnail   String?
+  style       Json     @default("{}")
+  position    Int
+  visible     Boolean  @default(true)
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, position])
+}
+
+model Badge {
+  id          String      @id // OWNER, ADMIN, MODERATOR, VERIFIED, EARLY, SUPPORTER, HORNS_PLUS, DEVELOPER, DESIGNER, OG
+  name        String
+  description String
+  rarity      Rarity
+  pixelIcon   String // key/path of original pixel-art SVG
+  adminOnly   Boolean     @default(false) // only ADMIN/OWNER may grant
+  users       UserBadge[]
+}
+
+model UserBadge {
+  userId     String
+  badgeId    String
+  assignedAt DateTime @default(now())
+  assignedBy String? // actor user id
+  visible    Boolean  @default(true)
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  badge      Badge    @relation(fields: [badgeId], references: [id])
+
+  @@id([userId, badgeId])
+}
+
+model ReservedUsername {
+  nameLower String   @id
+  reason    String?
+  createdAt DateTime @default(now())
+}
+
+model Subscription {
+  userId             String    @id
+  provider           String    @default("test") // payment-provider abstraction key
+  providerCustomerId String?
+  providerSubId      String?
+  status             SubStatus @default(NONE)
+  currentPeriodEnd   DateTime?
+  cancelAtPeriodEnd  Boolean   @default(false)
+  user               User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  events             SubscriptionEvent[]
+}
+
+// Entitlements are derived ONLY from Subscription rows written by verified provider webhooks
+// (or owner/admin actions in the audit log). Never from client state.
+model SubscriptionEvent {
+  id        String       @id @default(cuid())
+  userId    String
+  type      String // created, renewed, canceled, expired, manual_grant
+  providerEventId String? @unique // webhook idempotency
+  payload   Json         @default("{}")
+  createdAt DateTime     @default(now())
+  sub       Subscription @relation(fields: [userId], references: [userId], onDelete: Cascade)
+
+  @@index([userId, createdAt])
+}
+
+model Announcement {
+  id        String    @id @default(cuid())
+  title     String
+  body      String
+  active    Boolean   @default(true)
+  createdAt DateTime  @default(now())
+  expiresAt DateTime?
+}
+
+model FeatureFlag {
+  key       String   @id
+  enabled   Boolean  @default(false)
+  premium   Boolean  @default(false)
+  updatedAt DateTime @updatedAt
+}
+
+model AuditLog {
+  id        String   @id @default(cuid())
+  actorId   String
+  targetId  String?
+  action    String // badge.grant, user.suspend, user.delete, username.reserve...
+  meta      Json     @default("{}")
+  ip        String?
+  createdAt DateTime @default(now())
+  actor     User     @relation("AuditActor", fields: [actorId], references: [id])
+  target    User?    @relation("AuditTarget", fields: [targetId], references: [id])
+
+  @@index([createdAt])
+  @@index([actorId])
+}
